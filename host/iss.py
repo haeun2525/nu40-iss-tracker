@@ -7,12 +7,15 @@ iss.py — ISS 위치·다음 통과·탑승자를 받아 NU40(iss_tracker)로 U
 
 데이터 (키 필요 없음)
   위치   wheretheiss.at        5초마다 (지금 + 10초 뒤 두 점 → 북/남 방향)
-  통과   CelesTrak 궤도값(TLE)  하루 1번 받고, skyfield 로 내 위치 기준 계산
+  통과   CelesTrak 궤도값(TLE)  하루 1번 받고, skyfield 로 내 위치 기준 계산 (ISS·톈궁 중 먼저 오는 것)
+  톈궁   같은 궤도값으로 15초마다 위치 계산
+  스타링크 CelesTrak starlink 묶음, 3시간마다 4500개를 골라 보냄
   탑승자 Launch Library 2       1시간마다 (무료 한도 시간당 15회라 파일에 저장해 둠)
 
 내 위치는 host/.env 의 LAT=, LON= (깃에 안 올라감). 없으면 서울 강남구 일대.
 """
-import argparse, glob, json, os, sys, time, urllib.request
+import argparse, glob, json, math, os, random, sys, time, urllib.request
+from datetime import datetime, timezone
 
 try:
     import serial
@@ -66,13 +69,30 @@ def fix():
 # ── 다음 통과 ─────────────────────────────────────
 ts = load.timescale()
 me = wgs84.latlon(a.lat, a.lon)
-def tle():
-    s = cached("stations.tle", 86400, lambda: get("https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=tle"))
+def tle(catnr=25544):
+    s = cached(f"{catnr}.tle", 86400, lambda: get(f"https://celestrak.org/NORAD/elements/gp.php?CATNR={catnr}&FORMAT=tle"))
     l = [x.strip() for x in s.strip().splitlines()]
     return EarthSatellite(l[1], l[2], l[0], ts)
 
+def css_fix():
+    """톈궁(48274) 위치: ts lat lon alt asc"""
+    sat = tle(48274); now = int(time.time())
+    a, b = (wgs84.subpoint_of(sat.at(ts.from_datetime(datetime.fromtimestamp(x, timezone.utc)))) for x in (now, now + 10))
+    h = wgs84.height_of(sat.at(ts.from_datetime(datetime.fromtimestamp(now, timezone.utc)))).km
+    return f"K {now} {a.latitude.degrees:.4f} {a.longitude.degrees:.4f} {h:.1f} {1 if b.latitude.degrees > a.latitude.degrees else 0}"
+
 def next_pass():
-    sat = tle(); now = ts.now()
+    """ISS·톈궁 중 먼저 오는 통과"""
+    best = None
+    for who, cat in ((0, 25544), (1, 48274)):
+        r = pass_of(tle(cat))
+        if r and (best is None or r[0] < best[0]): best = (r[0], who, r[1])
+    if not best: return None
+    lines = best[2]; lines[0] += f" {best[1]}"
+    return lines
+
+def pass_of(sat):
+    now = ts.now()
     t, ev = sat.find_events(me, now - 0.01, now + 2, altitude_degrees=0.0)
     rise = None
     for ti, e in zip(t, ev):
@@ -85,8 +105,48 @@ def next_pass():
             mx = float(max(alt.degrees))
             if mx < 10: rise = None; continue   # 지평선에 스치는 건 건너뜀
             pts = " ".join(f"{z:.1f},{max(h, 0):.1f}" for z, h in zip(az.degrees, alt.degrees))
-            return [f"N {int(rise.utc_datetime().timestamp())} {int(ti.utc_datetime().timestamp())} {mx:.1f}", f"Q {pts}"]
+            st = int(rise.utc_datetime().timestamp())
+            return st, [f"N {st} {int(ti.utc_datetime().timestamp())} {mx:.1f}", f"Q {pts}"]
     return None
+
+# ── 스타링크 ──────────────────────────────────────
+# 보드 메모리 때문에 4500개만 보낸다. 가장 최근 발사분은 전부 넣는다.
+SL_MAX = 4500
+def starlink_lines():
+    s = cached("starlink.tle", 6 * 3600, lambda: get("https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle", 30))
+    if not s: return None
+    L = [x.rstrip() for x in s.splitlines()]
+    sats = []
+    for i in range(0, len(L) - 2, 3):
+        try: sats.append(EarthSatellite(L[i + 1], L[i + 2], L[i].strip(), ts))
+        except Exception: pass
+    now = int(time.time())
+    t0 = ts.from_datetime(datetime.fromtimestamp(now, timezone.utc)); t1 = ts.from_datetime(datetime.fromtimestamp(now + 10, timezone.utc))
+    newest = max(x.model.intldesg[:5] for x in sats)
+    total = len(sats)
+    keep = [x for x in sats if x.model.intldesg[:5] == newest]
+    rest = [x for x in sats if x.model.intldesg[:5] != newest]
+    random.Random(1).shuffle(rest)
+    keep += rest[:SL_MAX - len(keep)]
+    incs, recs = [], []
+    for x in keep:
+        pa = x.at(t0); a = wgs84.subpoint_of(pa); b = wgs84.subpoint_of(x.at(t1)); h = wgs84.height_of(pa).km
+        if h < 200: continue
+        inc = math.degrees(x.model.inclo); key = round(inc * 2) / 2      # 0.5도 단위로 묶음
+        if key not in incs: incs.append(key)
+        ii = incs.index(key); ir = math.radians(key)
+        la, lo = math.radians(a.latitude.degrees), math.radians(a.longitude.degrees)
+        sv = max(-1, min(1, math.sin(la) / math.sin(ir)))
+        u0 = math.asin(sv) if b.latitude.degrees > a.latitude.degrees else math.pi - math.asin(sv)
+        om0 = lo - math.atan2(math.cos(ir) * math.sin(u0), math.cos(u0))
+        enc = lambda r: int((r % (2 * math.pi)) / (2 * math.pi) * 65536) % 65536
+        P = int(round(2 * math.pi / x.model.no_kozai * 60))
+        recs.append(f"{enc(u0)} {enc(om0)} {P} {ii} {max(0, min(255, int((h - 200) / 2)))} {1 if x.model.intldesg[:5] == newest else 0}")
+    out = ["I " + " ".join(f"{v:g}" for v in incs[:32]), f"W {now} {total} {len(recs)}"]
+    for i in range(0, len(recs), 40):
+        out.append("X " + " ".join(recs[i:i + 40]))
+    print(f"스타링크 전체 {total}개 중 {len(recs)}개 보냄 (최근 발사 {newest}: {sum(1 for x in keep if x.model.intldesg[:5] == newest)}개)")
+    return out
 
 # ── 탑승자 ────────────────────────────────────────
 def short(name, ag):
@@ -119,14 +179,14 @@ def tz():
 
 def main():
     port = find_port(); print("보드:", port, "| 위치:", a.lat, a.lon)
-    s = None; t_fix = t_pass = t_crew = 0; pass_lines = crew = None
+    s = None; t_fix = t_pass = t_crew = t_css = t_sl = 0; pass_lines = crew = None
     send = lambda *ls: s.write("".join(l + "\n" for l in ls).encode())
     while True:
         try:
             if s is None:
                 s = serial.Serial(port, 115200, timeout=0); time.sleep(1.5)
                 send(f"T {time.time():.1f}", f"Z {tz()}", f"L {a.lat} {a.lon}", f"S {a.screen}")
-                t_pass = t_crew = 0
+                t_pass = t_crew = t_css = t_sl = 0
             now = time.time()
             if now >= t_fix:
                 t_fix = now + a.every
@@ -142,9 +202,19 @@ def main():
                     if pl: send(*pl)
                     if pl and pl != pass_lines:
                         pass_lines = pl; st = int(pl[0].split()[1])
-                        print("다음 통과:", time.strftime("%m/%d %H:%M", time.localtime(st)), "최대", pl[0].split()[3], "도")
+                        print("다음 통과:", ["ISS", "톈궁"][int(pl[0].split()[4])], time.strftime("%m/%d %H:%M", time.localtime(st)), "최대", pl[0].split()[3], "도")
                 except Exception as e:
                     print("통과 계산 실패:", e)
+            if now >= t_css:
+                t_css = now + 15
+                try: send(css_fix())
+                except Exception as e: print("톈궁 실패:", e)
+            if now >= t_sl:
+                t_sl = now + 3 * 3600
+                try:
+                    sl = starlink_lines()
+                    if sl: send(*sl)
+                except Exception as e: print("스타링크 실패:", e)
             if now >= t_crew:
                 t_crew = now + 600
                 cl = crew_lines()

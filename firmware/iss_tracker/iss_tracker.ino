@@ -16,7 +16,12 @@
  *   Q az,el az,el ...                   통과 경로 (N 다음에)
  *   C                                   탑승자 비우기
  *   M <우주선>|<이름>|<기관>             탑승자 한 명
- *   S <0|1|2|3|9>                       화면 고정, 9 = 자동
+ *   K <ts> <lat> <lon> <alt> <asc>      톈궁 위치
+ *   N 뒤 넷째 값                         통과 주인 (0 ISS, 1 톈궁)
+ *   I <경사각...>                        스타링크 경사각 표
+ *   W <ts> <전체수> <보낼수>              스타링크 받기 시작
+ *   X u0 om0 P inc alt new ...           스타링크 (6개씩 반복)
+ *   S <0~6|9>                           화면 고정 (4 톈궁 5 스타링크 6 서울 하늘 스타링크), 9 = 자동
  */
 #include <Arduino_GFX_Library.h>
 #include "FreeMonoBold9pt7b.h"
@@ -26,6 +31,7 @@
 #include "Org_01.h"
 #include "land.h"
 #include "types.h"
+#include "ko_font.h"
 
 #define LCD_CS  44
 #define LCD_DC  43
@@ -61,26 +67,30 @@ double epochBase = 0; uint32_t epochAtMs = 0; long tzSec = 32400;
 double nowUtc() { return epochBase + (millis() - epochAtMs) / 1000.0; }
 
 // ── 궤도 ─────────────────────────────────────────
-const float DEG = PI / 180, RE = 6371, INC = 51.64f * DEG, PERIOD = 92.9f * 60, WE = 2 * PI / 86164.0f, PREC = -5.0f * DEG / 86400;
+const float DEG = PI / 180, RE = 6371, WE = 2 * PI / 86164.0f;
 const double LAUNCH = 911544000;  // 1998-11-20 06:40 UTC 자랴 발사
-struct Fix { double ts = 0; float lat, lon, alt = 416, vel = 27600, u0, om0; bool ok = false; } fix;
+// 원궤도 근사. 맥이 5~30초마다 새 위치를 주고 그 사이만 이어 계산한다.
+Fix fix = { 0, 51.64f * DEG, 92.9f * 60, -5.0f * DEG / 86400, 416, 27600, 0, 0, 0, 0, false };    // ISS
+Fix cssFix = { 0, 41.47f * DEG, 5533.3f, -6.0f * DEG / 86400, 385, 27700, 0, 0, 0, 0, false };     // 톈궁
 float meLat = 37.50f * DEG, meLon = 127.06f * DEG;
 
-void setFix(double ts, float latd, float lond, float alt, float vel, bool asc) {
-  fix.ts = ts; fix.lat = latd * DEG; fix.lon = lond * DEG; fix.alt = alt; fix.vel = vel;
-  float s = constrain(sinf(fix.lat) / sinf(INC), -1.f, 1.f);
-  fix.u0 = asc ? asinf(s) : PI - asinf(s);
-  fix.om0 = fix.lon - atan2f(cosf(INC) * sinf(fix.u0), cosf(fix.u0));
-  fix.ok = true;
+void setFix(Fix &f, double ts, float latd, float lond, float alt, float vel, bool asc) {
+  f.ts = ts; f.alt = alt; f.vel = vel; f.si = sinf(f.inc); f.ci = cosf(f.inc);
+  float s = constrain(sinf(latd * DEG) / f.si, -1.f, 1.f);
+  f.u0 = asc ? asinf(s) : PI - asinf(s);
+  f.om0 = lond * DEG - atan2f(f.ci * sinf(f.u0), cosf(f.u0));
+  f.ok = true;
 }
 float wrapA(float a) { return atan2f(sinf(a), cosf(a)); }
-Pos iss(double t) {
-  float dt = (float)(t - fix.ts), u = fix.u0 + 2 * PI * dt / PERIOD;
-  Pos p; p.lat = asinf(sinf(INC) * sinf(u));
-  p.lon = wrapA(fix.om0 - WE * dt + PREC * dt + atan2f(cosf(INC) * sinf(u), cosf(u)));
-  p.alt = fix.alt; p.phase = fmodf(fmodf(u, 2 * PI) + 2 * PI, 2 * PI);
+Pos prop(const Fix &f, double t) {
+  float dt = (float)(t - f.ts), u = f.u0 + 2 * PI * dt / f.P;
+  Pos p; p.lat = asinf(f.si * sinf(u));
+  p.lon = wrapA(f.om0 - WE * dt + f.prec * dt + atan2f(f.ci * sinf(u), cosf(u)));
+  p.alt = f.alt; p.phase = fmodf(fmodf(u, 2 * PI) + 2 * PI, 2 * PI);
   return p;
 }
+Pos iss(double t) { return prop(fix, t); }
+Pos cssPos(double t) { return prop(cssFix, t); }
 V3 vec(float la, float lo) { return { cosf(la) * cosf(lo), cosf(la) * sinf(lo), sinf(la) }; }
 float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 V3 sunVec(double t) {
@@ -110,30 +120,40 @@ void lookAngles(Pos p, float &el, float &az) {
 
 // ── 통과 · 탑승자 ─────────────────────────────────
 #define MAXQ 90
-struct Pass { double start = 0, end = 0; float maxEl = 0; int n = 0; float az[MAXQ], el[MAXQ]; bool ok = false; } pass;
+struct Pass { double start = 0, end = 0; float maxEl = 0; int n = 0, who = 0; float az[MAXQ], el[MAXQ]; bool ok = false; } pass;
 struct Crew { char craft[12], name[24], ag[6]; };
 #define MAXC 16
 Crew crew[MAXC]; int nCrew = 0;
+
+// ── 스타링크 ─────────────────────────────────────
+// 1만 개 전부는 느리고 메모리도 빠듯해서 맥이 4500개를 골라 보낸다 (최근 발사분은 전부).
+#define MAXSL 4500
+struct SlSat { uint16_t u0, om0, P; uint8_t inc, alt; };   // P 맨 위 비트 = 최근 발사분, alt = (km-200)/2
+SlSat sl[MAXSL]; int slN = 0, slTotal = 0, slExpect = 0, slNewAll = 0; double slTs = 0;
+float slSi[32], slCi[32]; int slInc = 0;
+uint32_t slRxAt = 0;
 int screenMode = 9;
 
 // ── 글자 (GFX 글꼴을 늘리고 돌려서, 2x2 샘플 안티에일리어싱) ─────
 Paint P1(uint16_t c) { return { c, c, 0, 0, 1 }; }
 float capH(const GFXfont *f) { return f->glyph['A' - f->first].height; }
-float advOf(const GFXfont *f, char ch, float sc) {
-  if (ch == '*') return 5 * sc; if (ch == '^') return 4 * sc;
+float advOf(const GFXfont *f, uint8_t ch, float sc) {
+  float un = capH(f) / 5 * sc;  // 특수 기호 크기 단위 (Org_01 에서 sc 와 같다)
+  if (ch == '*') return 5 * un; if (ch == '^') return 4 * un;
   if (ch < f->first || ch > f->last) return 0;
   return f->glyph[ch - f->first].xAdvance * sc;
 }
 float textW(const char *s, const GFXfont *f, float sc, float sp) {
-  float w = 0; for (; *s; s++) w += advOf(f, *s, sc) + sp; return w - sp;
+  float w = 0; for (; *s; s++) w += advOf(f, (uint8_t)*s, sc) + sp; return w - sp;
 }
-void drawGlyph(const GFXfont *f, char ch, float ox, float oy, float Tx, float Ty, float sc, Paint &p, float uBase) {
+void drawGlyph(const GFXfont *f, uint8_t ch, float ox, float oy, float Tx, float Ty, float sc, Paint &p, float uBase) {
   float Dx = -Ty, Dy = Tx;
+  float un = capH(f) / 5 * sc;
   if (ch == '*' || ch == '^') {
     float ch2 = capH(f) * sc;
-    float cx = ox + (ch == '*' ? 2.5f * sc : 2 * sc) * Tx + (ch == '*' ? -ch2 / 2 : -ch2 + 1.4f * sc) * Dx;
-    float cy = oy + (ch == '*' ? 2.5f * sc : 2 * sc) * Ty + (ch == '*' ? -ch2 / 2 : -ch2 + 1.4f * sc) * Dy;
-    float rr = ch == '*' ? 0.9f * sc : 1.4f * sc;
+    float cx = ox + (ch == '*' ? 2.5f * un : 2 * un) * Tx + (ch == '*' ? -ch2 / 2 : -ch2 + 1.4f * un) * Dx;
+    float cy = oy + (ch == '*' ? 2.5f * un : 2 * un) * Ty + (ch == '*' ? -ch2 / 2 : -ch2 + 1.4f * un) * Dy;
+    float rr = ch == '*' ? 0.9f * un : 1.4f * un;
     for (int y = (int)(cy - rr - 1); y <= cy + rr + 1; y++)
       for (int x = (int)(cx - rr - 1); x <= cx + rr + 1; x++) {
         float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
@@ -176,8 +196,27 @@ float drawText(const char *s, float x, float y, const GFXfont *f, float sc, Pain
   float w = textW(s, f, sc, sp), cur = align == 0 ? x - w / 2 : align < 0 ? x : x - w;
   if (p.mode == 1) { p.len = w; }
   float start = cur;
-  for (; *s; s++) { drawGlyph(f, *s, cur, y, 1, 0, sc, p, cur - start); cur += advOf(f, *s, sc) + sp; }
+  for (; *s; s++) { drawGlyph(f, (uint8_t)*s, cur, y, 1, 0, sc, p, cur - start); cur += advOf(f, (uint8_t)*s, sc) + sp; }
   return w;
+}
+// UTF-8 → 한글 글꼴 번호 (아스키 그대로, 한글은 0x7F+순번, · → *, ° → ^)
+void ko(const char *in, char *out, int n) {
+  int o = 0; const uint8_t *s = (const uint8_t *)in;
+  while (*s && o < n - 1) {
+    uint32_t cp; int len;
+    if (*s < 0x80) { cp = *s; len = 1; } else if ((*s & 0xE0) == 0xC0) { cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F); len = 2; }
+    else { cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); len = 3; }
+    s += len;
+    if (cp < 0x80) out[o++] = cp;
+    else if (cp == 0xB7) out[o++] = '*';
+    else if (cp == 0xB0) out[o++] = '^';
+    else for (int i = 0; i < KO_N; i++) if (KO_CP[i] == cp) { out[o++] = 0x7F + i; break; }
+  }
+  out[o] = 0;
+}
+// 한글 섞인 글 (작은 글씨 약 12px, big 이면 약 20px)
+float koText(const char *s, float x, float y, Paint p, int align = 0, bool big = false, float sc = .5f) {
+  char b[96]; ko(s, b, sizeof b); return drawText(b, x, y, big ? &KoL : &KoS, sc, p, align, 0);
 }
 // 원 둘레 글자. bottom=false 면 위쪽(바깥으로 서서 시계방향), true 면 아래쪽(왼→오)
 void arcText(const char *s, float r, float center, bool bottom, const GFXfont *f, float sc, Paint p, float sp) {
@@ -194,7 +233,7 @@ void arcText(const char *s, float r, float center, bool bottom, const GFXfont *f
 }
 
 // ── 공통 그림 ────────────────────────────────────
-uint16_t bgLut[4][272];
+uint16_t bgLut[6][272];
 void makeBg(int i, uint32_t c1, uint32_t c2) {
   for (int k = 0; k < 272; k++) { float d = sqrtf(k * 128 + 64); bgLut[i][k] = mixf(H(c1), H(c2), (d - 10) / 160); }
 }
@@ -246,11 +285,12 @@ const char *dirName(float az) { static const char *d[8] = { "N", "NE", "E", "SE"
 // ── 01 궤도 ──────────────────────────────────────
 float sinR[90], cosR[90], sinC[180], cosC[180];
 uint16_t oceanLut[64];
-void drawOrbit(double t) {
-  Pos p = iss(t); V3 s = sunVec(t);
-  const int cx = 120, cy = 120; const float R = 84;
-  fillBg(0); drawStars((float)fmod(t, 10000.0));
-  float sl = sinf(p.lat), cl = cosf(p.lat), so = sinf(p.lon), co = cosf(p.lon);
+// 지구 한 판: 바다·대기·낮밤·육지. (clat, clon) 이 화면 가운데.
+View drawEarth(double t, float clat, float clon, float R, int bgi) {
+  V3 s = sunVec(t);
+  const int cx = 120, cy = 120;
+  fillBg(bgi); drawStars((float)fmod(t, 10000.0));
+  float sl = sinf(clat), cl = cosf(clat), so = sinf(clon), co = cosf(clon);
   V3 E = { -so, co, 0 }, N = { -sl * co, -sl * so, cl }, U = { cl * co, cl * so, sl };
   V3 sv = { dot(s, E), dot(s, N), dot(s, U) };
   const float hx = cx - R * .35f, hy = cy - R * .4f;
@@ -294,14 +334,31 @@ void drawOrbit(double t) {
         setPx(ix, iy, C_NIGHT); if (vz > .45f) { setPx(ix + 1, iy, C_NIGHT); setPx(ix, iy + 1, C_NIGHT); setPx(ix + 1, iy + 1, C_NIGHT); }
       }
     }
+  return { E, N, U, R, cx, cy };
+}
+void cssIcon(float x, float y, float s, float ang) {
+  glow(x, y, 15 * s, C_RED, .55f);
+  float ca = cosf(ang) * s, sa = sinf(ang) * s;
+  quad(x, y, ca, sa, -9, -1, 18, 2, C_WHITE);            // 원톈·멍톈 실험 모듈
+  quad(x, y, ca, sa, -1.8f, -5, 3.6f, 10, C_WHITE);      // 톈허 핵심 모듈
+  quad(x, y, ca, sa, -14, -6, 4.5f, 12, C_PANEL); quad(x, y, ca, sa, 9.5f, -6, 4.5f, 12, C_PANEL);
+  quad(x, y, ca, sa, -4.5f, -7.6f, 9, 1.8f, C_PANEL);
+}
+// w = 0 ISS, 1 톈궁
+void drawOrbit(double t, int w) {
+  const Fix &F = w ? cssFix : fix;
+  Pos p = prop(F, t);
+  View v0 = drawEarth(t, p.lat, p.lon, 84, w ? 4 : 0);
+  V3 E = v0.E, N = v0.N, U = v0.U; const float R = v0.R; const int cx = v0.cx, cy = v0.cy;
+  const uint16_t cPast = w ? C_RED : C_CYAN, cNext = w ? C_GOLD : C_ORANGE;
   // 궤적: 지나온 길 파랑, 갈 길 주황 점선
   float px = 0, py = 0, pz = -1; const uint16_t sea = H(0x0c2766);
   for (int k = -55; k <= 55; k++) {
-    Pos q = iss(t + k * 60.0); V3 v = vec(q.lat, q.lon);
+    Pos q = prop(F, t + k * 60.0); V3 v = vec(q.lat, q.lon);
     float X = cx + R * dot(v, E), Y = cy - R * dot(v, N), Z = dot(v, U);
     if (pz > 0 && Z > 0) {
-      if (k <= 0) { uint16_t c = mixf(sea, C_CYAN, .15f + .8f * (1 + k / 55.f)); g->drawLine(px, py, X, Y, c); g->drawLine(px + 1, py, X + 1, Y, c); }
-      else if (k % 2 == 0) { uint16_t c = mixf(C_ORANGE, sea, k / 70.f); g->drawLine(px, py, X, Y, c); g->drawLine(px + 1, py, X + 1, Y, c); }
+      if (k <= 0) { uint16_t c = mixf(sea, cPast, .15f + .8f * (1 + k / 55.f)); g->drawLine(px, py, X, Y, c); g->drawLine(px + 1, py, X + 1, Y, c); }
+      else if (k % 2 == 0) { uint16_t c = mixf(cNext, sea, k / 70.f); g->drawLine(px, py, X, Y, c); g->drawLine(px + 1, py, X + 1, Y, c); }
     }
     px = X; py = Y; pz = Z;
   }
@@ -312,10 +369,23 @@ void drawOrbit(double t) {
     g->drawCircle(lroundf(X), lroundf(Y), lroundf(rr), C_MAG);
     drawText("SEOUL", X + 6, Y - 4, &Org_01, 1.2f, P1(C_MAG), -1, .4f);
   }
-  Pos f = iss(t + 30); V3 fv = vec(f.lat, f.lon);
-  issIcon(cx, cy, 1, atan2f(-(R * dot(fv, N)), R * dot(fv, E)));
-  arcText("ISS * ZARYA * NORAD 25544", 106, -PI / 2, false, &Org_01, 1.5f, P1(C_CYAN), 1.6f);
-  char b[48]; snprintf(b, sizeof b, "%.1f KM * %d,%03d KM/H", p.alt, (int)fix.vel / 1000, (int)fix.vel % 1000);
+  // 다른 정거장이 같은 쪽에 있으면 작게
+  const Fix &O = w ? fix : cssFix;
+  if (O.ok) {
+    Pos q = prop(O, t); V3 qv = vec(q.lat, q.lon);
+    if (dot(qv, U) > 0) {
+      float X = cx + R * dot(qv, E), Y = cy - R * dot(qv, N);
+      if (w) issIcon(X, Y, .55f, 0); else cssIcon(X, Y, .5f, 0);
+      drawText(w ? "ISS" : "CSS", X + 8, Y - 5, &Org_01, 1.2f, P1(w ? C_CYAN : C_RED), -1, .4f);
+    }
+  }
+  Pos f = prop(F, t + 30); V3 fv = vec(f.lat, f.lon);
+  float ang = atan2f(-(R * dot(fv, N)), R * dot(fv, E));
+  if (w) cssIcon(cx, cy, 1, ang); else issIcon(cx, cy, 1, ang);
+  arcText(w ? "TIANGONG * CSS * NORAD 48274" : "ISS * ZARYA * NORAD 25544", 106, -PI / 2, false, &Org_01, 1.5f, P1(w ? C_RED : C_CYAN), 1.4f);
+  char b[48];
+  if (w) snprintf(b, sizeof b, "%.1f KM * CREW 3", p.alt);
+  else snprintf(b, sizeof b, "%.1f KM * %d,%03d KM/H", p.alt, (int)fix.vel / 1000, (int)fix.vel % 1000);
   arcText(b, 115, PI / 2, true, &Org_01, 1.5f, P1(C_FG), 1.2f);
 }
 
@@ -342,39 +412,48 @@ void drawTele(double t) {
   discAA(120, 17, 3, C_CYAN);
   glow(ex, ey, 11, C_MAG, .8f); discAA(ex, ey, 3.4f, C_WHITE);
 
-  char b[48]; double met = t - LAUNCH; long dd = (long)(met / 86400); long ss = (long)fmod(met, 86400.0);
-  drawText("MISSION ELAPSED", 120, 41, &Org_01, 1.3f, P1(C_ORANGE), 0, 1.2f);
-  snprintf(b, sizeof b, "D+%ld,%03ld  %02ld:%02ld:%02ld", dd / 1000, dd % 1000, ss / 3600, ss / 60 % 60, ss % 60);
-  drawText(b, 120, 54, &Org_01, 1.6f, P1(C_FG), 0, .6f);
-  drawText("VELOCITY", 120, 75, &Org_01, 1.3f, P1(C_MUTED), 0, 1.4f);
+  char b[64]; double met = t - LAUNCH; long dd = (long)(met / 86400);
+  koText("우주에 뜬 지", 120, 40, P1(C_ORANGE));
+  snprintf(b, sizeof b, "%ld,%03ld일째", dd / 1000, dd % 1000); koText(b, 120, 55, P1(C_FG));
+  koText("속도", 120, 74, P1(C_MUTED));
   snprintf(b, sizeof b, "%d,%03d", (int)fix.vel / 1000, (int)fix.vel % 1000);
-  drawText(b, 120, 106, &FreeMonoBold18pt7b, 1, { C_CYAN, C_WHITE, 1, 0, 1 }, 0, -1);
-  drawText("KM/H", 120, 118, &Org_01, 1.3f, P1(C_MUTED), 0, 1);
+  drawText(b, 120, 104, &FreeMonoBold18pt7b, 1, { C_CYAN, C_WHITE, 1, 0, 1 }, 0, -1);
+  snprintf(b, sizeof b, "km/h · 1초에 %.1fkm", fix.vel / 3600); koText(b, 120, 119, P1(C_MUTED));
   uint16_t ln = mixf(H(0x070a1c), C_MUTED, .3f);
-  g->drawFastHLine(50, 128, 140, ln); g->drawFastVLine(120, 134, 26, ln);
-  drawText("ALTITUDE", 84, 141, &Org_01, 1.2f, P1(C_MUTED), 0, 1); drawText("PERIOD", 156, 141, &Org_01, 1.2f, P1(C_MUTED), 0, 1);
-  snprintf(b, sizeof b, "%.1f", p.alt); drawText(b, 80, 157, &FreeMonoBold9pt7b, 1, P1(C_FG), 0, -1);
-  drawText("92.9", 152, 157, &FreeMonoBold9pt7b, 1, P1(C_FG), 0, -1);
-  drawText("KM", 108, 157, &Org_01, 1.1f, P1(C_MUTED), 0, .5f); drawText("MIN", 178, 157, &Org_01, 1.1f, P1(C_MUTED), 0, .5f);
-  snprintf(b, sizeof b, "%05.2f^%c  %06.2f^%c", fabsf(p.lat / DEG), p.lat >= 0 ? 'N' : 'S', fabsf(p.lon / DEG), p.lon >= 0 ? 'E' : 'W');
-  drawText(b, 120, 175, &Org_01, 1.5f, P1(C_CYAN), 0, .5f);
+  g->drawFastHLine(50, 127, 140, ln); g->drawFastVLine(120, 132, 28, ln);
+  koText("높이", 84, 142, P1(C_MUTED)); koText("한 바퀴", 156, 142, P1(C_MUTED));
+  snprintf(b, sizeof b, "%.1f", p.alt); drawText(b, 80, 158, &FreeMonoBold9pt7b, 1, P1(C_FG), 0, -1);
+  drawText("92.9", 150, 158, &FreeMonoBold9pt7b, 1, P1(C_FG), 0, -1);
+  koText("km", 104, 158, P1(C_MUTED), -1); koText("분", 168, 158, P1(C_MUTED), -1);
+  snprintf(b, sizeof b, "%s %.1f°  %s %.1f°", p.lat >= 0 ? "북위" : "남위", fabsf(p.lat / DEG), p.lon >= 0 ? "동경" : "서경", fabsf(p.lon / DEG));
+  koText(b, 120, 175, P1(C_CYAN));
   int km = (int)groundKm(p.lat, p.lon, meLat, meLon);
-  if (km >= 1000) snprintf(b, sizeof b, "%d,%03d KM FROM SEOUL", km / 1000, km % 1000); else snprintf(b, sizeof b, "%d KM FROM SEOUL", km);
-  drawText(b, 120, 188, &Org_01, 1.2f, P1(C_MUTED), 0, .6f);
-  const char *lab = lit ? "DAYLIGHT" : "ECLIPSE"; uint16_t col = lit ? C_GOLD : C_VIOLET;
-  int w = (int)textW(lab, &Org_01, 1.3f, 1.2f) + 24;
-  g->fillRoundRect(120 - w / 2, 195, w, 15, 7, mixf(H(0x070a1c), col, lit ? .16f : .22f));
-  g->drawRoundRect(120 - w / 2, 195, w, 15, 7, col);
-  discAA(120 - w / 2 + 9, 202.5f, 2.8f, col);
-  if (!lit) discAA(120 - w / 2 + 10.4f, 201.3f, 2.3f, mixf(H(0x070a1c), col, .22f));
-  drawText(lab, 120 - w / 2 + 15, 205.5f, &Org_01, 1.3f, P1(col), -1, 1.2f);
+  if (km >= 1000) snprintf(b, sizeof b, "서울에서 %d,%03dkm", km / 1000, km % 1000); else snprintf(b, sizeof b, "서울에서 %dkm", km);
+  koText(b, 120, 190, P1(C_MUTED));
+  const char *lab = lit ? "햇빛 받는 중" : "지구 그림자 속"; uint16_t col = lit ? C_GOLD : C_VIOLET;
+  char kb[48]; ko(lab, kb, sizeof kb);
+  int w = (int)textW(kb, &KoS, .5f, 0) + 24;
+  g->fillRoundRect(120 - w / 2, 196, w, 17, 8, mixf(H(0x070a1c), col, lit ? .16f : .22f));
+  g->drawRoundRect(120 - w / 2, 196, w, 17, 8, col);
+  discAA(120 - w / 2 + 9, 204.5f, 2.8f, col);
+  if (!lit) discAA(120 - w / 2 + 10.4f, 203.3f, 2.3f, mixf(H(0x070a1c), col, .22f));
+  drawText(kb, 120 - w / 2 + 15, 209, &KoS, .5f, P1(col), -1, 0);
 }
 
 // ── 03 다음 통과 ─────────────────────────────────
 void domeXY(float az, float el, float cx, float cy, float R, float &x, float &y) {
   float r = R * (90 - max(el, 0.f)) / 90, a = az * DEG; x = cx + r * sinf(a); y = cy - r * cosf(a);
 }
-void fmtHMS(char *b, size_t n, long s) { snprintf(b, n, "T-%02ld:%02ld:%02ld", s / 3600, s / 60 % 60, s % 60); }
+const char *dirKo(float az) { static const char *d[8] = { "북", "북동", "동", "남동", "남", "남서", "서", "북서" }; return d[((int)lroundf(az / 45)) % 8]; }
+void leftKo(char *b, size_t n, long s) {
+  long h = s / 3600, m = s / 60 % 60, x = s % 60;
+  if (h) snprintf(b, n, "%ld시간 %ld분", h, m); else if (m) snprintf(b, n, "%ld분 %ld초", m, x); else snprintf(b, n, "%ld초", x);
+}
+void whenKo(char *b, size_t n, double t) {
+  long sd = (long)fmod(t + tzSec, 86400.0), h = sd / 3600, m = sd / 60 % 60;
+  const char *w = h < 6 ? "새벽" : h < 12 ? "오전" : h < 18 ? "오후" : "저녁";
+  snprintf(b, n, "%s %ld:%02ld", w, h % 12 ? h % 12 : 12, m);
+}
 void drawPass(double t) {
   fillBg(2); drawStars((float)fmod(t, 10000.0) * .5f);
   const float cx = 120, cy = 84, R = 60;
@@ -389,36 +468,42 @@ void drawPass(double t) {
   drawText("N", cx, cy - R - 4, &Org_01, 1.4f, P1(C_MUTED)); drawText("S", cx, cy + R + 10, &Org_01, 1.4f, P1(C_MUTED));
   drawText("E", cx + R + 7, cy + 3, &Org_01, 1.4f, P1(C_MUTED)); drawText("W", cx - R - 7, cy + 3, &Org_01, 1.4f, P1(C_MUTED));
   drawText("30^", cx + 9, cy - R * 2 / 3 - 2, &Org_01, 1.05f, P1(C_MUTED)); drawText("60^", cx + 9, cy - R / 3 - 2, &Org_01, 1.05f, P1(C_MUTED));
-  char b[48];
-  if (!pass.ok) { drawText("CALCULATING PASS", 120, 186, &Org_01, 1.4f, P1(C_MUTED), 0, 1.2f); return; }
+  char b[64];
+  if (!pass.ok) { koText("통과 계산 중", 120, 186, P1(C_MUTED)); return; }
+  const bool cs = pass.who == 1; const uint16_t c1 = cs ? C_RED : C_CYAN, c2 = cs ? C_GOLD : C_MAG;
+  const char *nm = cs ? "톈궁이" : "ISS가";
   float lx = 0, ly = 0;
   for (int i = 0; i < pass.n; i++) {
     float x, y; domeXY(pass.az[i], pass.el[i], cx, cy, R, x, y);
-    if (i) thickLine(lx, ly, x, y, mixf(C_CYAN, C_MAG, (float)i / pass.n), 1.1f);
+    if (i) thickLine(lx, ly, x, y, mixf(c1, c2, (float)i / pass.n), 1.1f);
     lx = x; ly = y;
   }
   if (pass.n >= 3) {
     float bx, by; domeXY(pass.az[pass.n - 3], pass.el[pass.n - 3], cx, cy, R, bx, by);
     float an = atan2f(ly - by, lx - bx);
-    g->fillTriangle(lx + 6 * cosf(an), ly + 6 * sinf(an), lx + 5 * cosf(an + 2.4f), ly + 5 * sinf(an + 2.4f), lx + 5 * cosf(an - 2.4f), ly + 5 * sinf(an - 2.4f), C_MAG);
-    float sx, sy; domeXY(pass.az[0], pass.el[0], cx, cy, R, sx, sy); discAA(sx, sy, 2.6f, C_CYAN);
+    g->fillTriangle(lx + 6 * cosf(an), ly + 6 * sinf(an), lx + 5 * cosf(an + 2.4f), ly + 5 * sinf(an + 2.4f), lx + 5 * cosf(an - 2.4f), ly + 5 * sinf(an - 2.4f), c2);
+    float sx, sy; domeXY(pass.az[0], pass.el[0], cx, cy, R, sx, sy); discAA(sx, sy, 2.6f, c1);
   }
+  // 가장 높이 뜨는 자리에 높이 (경로 안쪽으로 비켜서)
+  int mi = 0; for (int i = 1; i < pass.n; i++) if (pass.el[i] > pass.el[mi]) mi = i;
+  float hx, hy; domeXY(pass.az[mi], pass.el[mi], cx, cy, R, hx, hy);
+  float dl = sqrtf((cx - hx) * (cx - hx) + (cy - hy) * (cy - hy)); if (dl < 1) dl = 1;
+  snprintf(b, sizeof b, "최고 %d°", (int)lroundf(pass.maxEl));
+  koText(b, hx + (cx - hx) / dl * 14, hy + (cy - hy) / dl * 14 + 4, P1(C_FG), 0, false, .42f);
   bool live = t >= pass.start && t <= pass.end;
   if (live) {
-    float el, az; lookAngles(iss(t), el, az);
-    float x, y; domeXY(az, el, cx, cy, R, x, y); issIcon(x, y, .8f, 0);
-    drawText("OVERHEAD NOW", 120, 170, &Org_01, 1.5f, P1(C_GREEN), 0, 1.4f);
-    snprintf(b, sizeof b, "EL %d^", (int)lroundf(max(el, 0.f)));
-    drawText(b, 120, 195, &FreeMonoBold12pt7b, 1, { C_CYAN, C_MAG, 1, 0, 1 }, 0, 0);
-    snprintf(b, sizeof b, "AZ %d^ %s", (int)lroundf(az), dirName(az)); drawText(b, 120, 210, &Org_01, 1.4f, P1(C_FG), 0, .8f);
+    float el, az; lookAngles(cs ? cssPos(t) : iss(t), el, az);
+    float x, y; domeXY(az, el, cx, cy, R, x, y); if (cs) cssIcon(x, y, .7f, 0); else issIcon(x, y, .8f, 0);
+    snprintf(b, sizeof b, "%s 지금 서울 하늘에", nm); koText(b, 120, 172, P1(C_GREEN));
+    snprintf(b, sizeof b, "높이 %d°", (int)lroundf(max(el, 0.f))); koText(b, 120, 197, P1(C_FG), 0, true);
+    snprintf(b, sizeof b, "%s쪽 하늘을 보세요", dirKo(az)); koText(b, 120, 213, P1(C_MUTED));
   } else {
-    double st = pass.start + tzSec; long sd = (long)fmod(st, 86400.0);
-    snprintf(b, sizeof b, "NEXT PASS  %02ld:%02ld", sd / 3600, sd / 60 % 60);
-    drawText(b, 120, 170, &Org_01, 1.5f, P1(C_ORANGE), 0, 1.2f);
-    long rem = (long)(pass.start - t); if (rem < 0) rem = 0; fmtHMS(b, sizeof b, rem);
-    drawText(b, 120, 194, &FreeMonoBold12pt7b, 1, { C_CYAN, C_MAG, 1, 0, 1 }, 0, -1);
-    snprintf(b, sizeof b, "MAX %d^ * %s > %s", (int)lroundf(pass.maxEl), dirName(pass.az[0]), dirName(pass.az[pass.n - 1]));
-    drawText(b, 120, 210, &Org_01, 1.4f, P1(C_FG), 0, .8f);
+    snprintf(b, sizeof b, "%s 서울 하늘에 오기까지", nm); koText(b, 120, 172, P1(C_ORANGE));
+    long rem = (long)(pass.start - t); if (rem < 0) rem = 0; leftKo(b, sizeof b, rem);
+    koText(b, 120, 197, { c1, c2, 1, 0, 1 }, 0, true);
+    char w[24]; whenKo(w, sizeof w, pass.start);
+    snprintf(b, sizeof b, "%s · %s → %s", w, dirKo(pass.az[0]), dirKo(pass.az[pass.n - 1]));
+    koText(b, 120, 213, P1(C_FG));
   }
 }
 
@@ -454,6 +539,69 @@ void drawCrew(double t) {
   }
 }
 
+// ── 06 스타링크 군단 · 07 서울 하늘 스타링크 ─────────
+// 위성 i 의 지구 고정 좌표 단위벡터 (원궤도). 반환: 고도 km
+static inline float slVec(int i, double t, V3 &v) {
+  const SlSat &o = sl[i];
+  float P = o.P & 0x7FFF, dt = (float)(t - slTs);
+  float u = o.u0 * (2 * PI / 65536) + 2 * PI * dt / P, om = o.om0 * (2 * PI / 65536) - WE * dt;
+  float su = sinf(u), cu = cosf(u), so = sinf(om), co = cosf(om), ci = slCi[o.inc], si = slSi[o.inc];
+  v = { cu * co - su * ci * so, cu * so + su * ci * co, su * si };
+  return 200 + o.alt * 2;
+}
+const uint16_t C_ICE = H(0xcfe3ff);
+void drawSwarm(double t) {
+  View w = drawEarth(t, meLat, meLon, 74, 5);
+  for (int layer = 0; layer < 2; layer++)            // 뒤쪽 먼저, 그 위에 앞쪽
+    for (int i = 0; i < slN; i++) {
+      V3 v; float k = 1 + slVec(i, t, v) / RE;
+      float vx = dot(v, w.E) * k, vy = dot(v, w.N) * k, vz = dot(v, w.U) * k;
+      bool front = vz > 0, isNew = sl[i].P & 0x8000;
+      if (!front && vx * vx + vy * vy < 1) continue;   // 지구에 가려짐
+      if (isNew ? layer == 0 : (layer == 1) != front) continue;
+      int x = lroundf(w.cx + w.R * vx), y = lroundf(w.cy - w.R * vy);
+      if (isNew) { glow(x, y, 4, C_MAG, .5f); setPx(x, y, C_MAG); setPx(x + 1, y, C_MAG); }
+      else blendPx(x, y, C_ICE, front ? 150 : 60);
+    }
+  V3 m = vec(meLat, meLon);
+  g->drawCircle(w.cx + lroundf(w.R * dot(m, w.E)), w.cy - lroundf(w.R * dot(m, w.N)), 3, C_MAG);
+  arcText("STARLINK * SPACEX", 107, -PI / 2, false, &Org_01, 1.5f, P1(C_ICE), 1.8f);
+  char b[48], kb[64]; snprintf(b, sizeof b, "지구를 도는 %d,%03d개", slTotal / 1000, slTotal % 1000); ko(b, kb, sizeof kb);
+  arcText(kb, 118, PI / 2, true, &KoS, .5f, P1(C_FG), .3f);
+}
+void drawSlSky(double t) {
+  fillBg(2); drawStars((float)fmod(t, 10000.0) * .5f);
+  const float cx = 120, cy = 84, R = 60;
+  for (int y = cy - R; y <= cy + R; y++)
+    for (int x = cx - R; x <= cx + R; x++) {
+      float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)); if (d > R) continue;
+      float f = d / R; blendPx(x, y, mixf(C_CYAN, C_VIOLET, f), (int)((.06f + .14f * f) * 256));
+    }
+  uint16_t rc = mixf(H(0x0b1640), C_MUTED, .35f);
+  g->drawCircle(cx, cy, R, rc); g->drawCircle(cx, cy, R * 2 / 3, rc); g->drawCircle(cx, cy, R / 3, rc);
+  drawText("N", cx, cy - R - 4, &Org_01, 1.4f, P1(C_MUTED)); drawText("S", cx, cy + R + 10, &Org_01, 1.4f, P1(C_MUTED));
+  drawText("E", cx + R + 7, cy + 3, &Org_01, 1.4f, P1(C_MUTED)); drawText("W", cx - R - 7, cy + 3, &Org_01, 1.4f, P1(C_MUTED));
+  V3 o = vec(meLat, meLon), e = { -sinf(meLon), cosf(meLon), 0 }, n = { -sinf(meLat) * cosf(meLon), -sinf(meLat) * sinf(meLon), cosf(meLat) };
+  int cnt = 0, cntNew = 0;
+  for (int i = 0; i < slN; i++) {
+    V3 v; float r = RE + slVec(i, t, v);
+    if (dot(v, o) < .93f) continue;                       // 지평선 한참 아래는 미리 거름
+    V3 d = { r * v.x - RE * o.x, r * v.y - RE * o.y, r * v.z - RE * o.z };
+    float E = dot(d, e), N = dot(d, n), U = dot(d, o); if (U <= 0) continue;
+    float h = sqrtf(E * E + N * N), el = atan2f(U, h) / DEG, rr = R * (90 - el) / 90;
+    float x = cx + rr * E / h, y = cy - rr * N / h; cnt++;
+    if (sl[i].P & 0x8000) { cntNew++; glow(x, y, 5, C_MAG, .55f); discAA(x, y, 1.3f, C_MAG); }
+    else { int a = 90 + (int)(166 * el / 90); blendPx(lroundf(x), lroundf(y), C_ICE, a); if (el > 35) blendPx(lroundf(x) + 1, lroundf(y), C_ICE, a / 2); }
+  }
+  // 보드엔 일부만 있으니 실제 개수로 늘려서 보여준다 (최근 발사분은 전부 있으므로 그대로)
+  int shown = slN ? (int)lroundf((float)(cnt - cntNew) * (slTotal - slNewAll) / max(1, slN - slNewAll)) + cntNew : 0;
+  char b[64];
+  koText("지금 서울 하늘 위 스타링크", 120, 172, P1(C_ICE));
+  snprintf(b, sizeof b, "약 %d개", shown); koText(b, 120, 197, { C_WHITE, C_ICE, 1, 0, 1 }, 0, true);
+  if (cntNew) { snprintf(b, sizeof b, "분홍 = 최근 발사 %d개", cntNew); koText(b, 120, 213, P1(C_MAG)); }
+  else koText("최근 발사분은 지평선 아래", 120, 213, P1(C_MUTED));
+}
+
 // ── 기다림 ───────────────────────────────────────
 void drawWait(double t) {
   fillBg(0); float tf = (float)fmod(t, 10000.0); drawStars(tf);
@@ -484,9 +632,28 @@ void handle(char *s) {
   else if (c == 'L') { double v[2]; if (nums(a, v, 2) == 2) { meLat = v[0] * DEG; meLon = v[1] * DEG; } }
   else if (c == 'P') {
     double v[6];
-    if (nums(a, v, 6) == 6) setFix(v[0], v[1], v[2], v[3], v[4], v[5] > .5);
+    if (nums(a, v, 6) == 6) setFix(fix, v[0], v[1], v[2], v[3], v[4], v[5] > .5);
   }
-  else if (c == 'N') { double v[3]; if (nums(a, v, 3) == 3) { pass.start = v[0]; pass.end = v[1]; pass.maxEl = v[2]; pass.n = 0; } }
+  else if (c == 'K') {  // 톈궁: ts lat lon alt asc
+    double v[5];
+    if (nums(a, v, 5) == 5) setFix(cssFix, v[0], v[1], v[2], v[3], 27700, v[4] > .5);
+  }
+  else if (c == 'I') {  // 스타링크 경사각 표: I 53.05 43.0 ...
+    double v[32]; slInc = nums(a, v, 32);
+    for (int i = 0; i < slInc; i++) { slSi[i] = sinf(v[i] * DEG); slCi[i] = cosf(v[i] * DEG); }
+  }
+  else if (c == 'W') {  // 스타링크 받기 시작: ts 전체수 보낼수
+    double v[3]; if (nums(a, v, 3) == 3) { slTs = v[0]; slTotal = v[1]; slExpect = min((int)v[2], MAXSL); slN = 0; slNewAll = 0; slRxAt = millis(); }
+  }
+  else if (c == 'X') {  // 위성 여러 개: u0 om0 P inc alt new (6개씩, u0·om0 = 0~65535)
+    static double v[300]; int k = nums(a, v, 300);
+    for (int i = 0; i + 5 < k && slN < MAXSL; i += 6) {
+      SlSat &o = sl[slN++]; o.u0 = v[i]; o.om0 = v[i + 1]; o.P = ((uint16_t)v[i + 2] & 0x7FFF) | (v[i + 5] > .5 ? 0x8000 : 0);
+      o.inc = v[i + 3]; o.alt = v[i + 4]; if (o.P & 0x8000) slNewAll++;
+    }
+    slRxAt = millis();
+  }
+  else if (c == 'N') { double v[4]; int k = nums(a, v, 4); if (k >= 3) { pass.start = v[0]; pass.end = v[1]; pass.maxEl = v[2]; pass.who = k > 3 ? (int)v[3] : 0; pass.n = 0; } }
   else if (c == 'Q') {  // v 는 static: loop 스택이 4KB 라 1.4KB 배열을 두면 넘쳐서 보드가 죽는다
     pass.n = 0; static double v[2 * MAXQ]; int k = nums(a, v, 2 * MAXQ);
     for (int i = 0; i + 1 < k; i += 2) { pass.az[pass.n] = v[i]; pass.el[pass.n] = v[i + 1]; pass.n++; }
@@ -513,7 +680,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(LCD_BLK, OUTPUT); digitalWrite(LCD_BLK, HIGH);
   g->begin(); fb = g->getFramebuffer();
-  makeBg(0, 0x0a1238, 0x02030a); makeBg(1, 0x101a4a, 0x03040d); makeBg(2, 0x0b1640, 0x02030a); makeBg(3, 0x1a1250, 0x03040d);
+  makeBg(0, 0x0a1238, 0x02030a); makeBg(1, 0x101a4a, 0x03040d); makeBg(2, 0x0b1640, 0x02030a); makeBg(3, 0x1a1250, 0x03040d); makeBg(4, 0x1c0f2e, 0x02030a); makeBg(5, 0x08122e, 0x010208);
   for (int i = 0; i < 64; i++) { float t = i / 63.f; oceanLut[i] = t < .5f ? mixf(H(0x2160c4), H(0x0c2766), t * 2) : mixf(H(0x0c2766), H(0x050f33), t * 2 - 1); }
   for (int r = 0; r < 90; r++) { float la = (90 - (r + .5f) * 2) * DEG; sinR[r] = sinf(la); cosR[r] = cosf(la); }
   for (int c = 0; c < 180; c++) { float lo = (-180 + (c + .5f) * 2) * DEG; sinC[c] = sinf(lo); cosC[c] = cosf(lo); }
@@ -524,10 +691,14 @@ void setup() {
   }
 }
 
-const uint16_t DUR[4] = { 15000, 8000, 8000, 6000 };
+// 자동 순서: ISS 궤도 → 원격측정 → 다음 통과 → 톈궁 → 스타링크 군단 → 서울 하늘 스타링크 → 탑승자
+const int ORDER[7] = { 0, 1, 2, 4, 5, 6, 3 };
+const uint16_t DUR[7] = { 15000, 8000, 8000, 12000, 10000, 8000, 6000 };
 int autoScreen = 0; uint32_t screenAt = 0, fpsAt = 0; int frames = 0;
 void loop() {
   pollSerial();
+  // 스타링크 목록을 받는 동안은 그리지 않고 받기만 (한 번에 100KB 가까이 온다)
+  if (slN < slExpect && millis() - slRxAt < 1000) return;
   double t = epochBase > 0 ? nowUtc() : millis() / 1000.0;
   int scr;
   if (!fix.ok) scr = -1;
@@ -535,11 +706,18 @@ void loop() {
   else {
     bool live = pass.ok && t >= pass.start - 60 && t <= pass.end;
     if (live) scr = 2;
-    else { if (millis() - screenAt > DUR[autoScreen]) { autoScreen = (autoScreen + 1) % 4; screenAt = millis(); } scr = autoScreen; }
+    else {
+      if (millis() - screenAt > DUR[autoScreen]) {
+        autoScreen = (autoScreen + 1) % 7; screenAt = millis();
+        if (ORDER[autoScreen] == 4 && !cssFix.ok) autoScreen++;          // 데이터 없는 화면은 건너뜀
+        if ((ORDER[autoScreen] == 5 || ORDER[autoScreen] == 6) && !slN) autoScreen = 6;
+      }
+      scr = ORDER[autoScreen];
+    }
   }
-  switch (scr) { case 0: drawOrbit(t); break; case 1: drawTele(t); break; case 2: drawPass(t); break; case 3: drawCrew(t); break; default: drawWait(t); }
+  switch (scr) { case 0: drawOrbit(t, 0); break; case 4: drawOrbit(t, 1); break; case 5: drawSwarm(t); break; case 6: drawSlSky(t); break; case 1: drawTele(t); break; case 2: drawPass(t); break; case 3: drawCrew(t); break; default: drawWait(t); }
   pollSerial();
   g->flush();
   frames++;
-  if (millis() - fpsAt > 10000) { Serial.printf("fps %.1f scr %d crew %d pass %d\n", frames * 1000.0 / (millis() - fpsAt), scr, nCrew, pass.n); fpsAt = millis(); frames = 0; }
+  if (millis() - fpsAt > 10000) { Serial.printf("fps %.1f scr %d crew %d pass %d css %d sl %d/%d\n", frames * 1000.0 / (millis() - fpsAt), scr, nCrew, pass.n, cssFix.ok, slN, slTotal); fpsAt = millis(); frames = 0; }
 }
